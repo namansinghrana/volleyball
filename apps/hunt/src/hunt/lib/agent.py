@@ -1,39 +1,63 @@
 import os
-from groq import Groq
 from dotenv import load_dotenv
 
 from models import GeoQuery
 from tools import search_volleyball_facilities, geocode_location
-from prompts import AGENT_PROMPT
+
 from langchain_core.tools import StructuredTool
-from langchain.agents import initialize_agent, AgentType
 from langchain_groq import ChatGroq
 
-def _resolve_coordinates(
+# ----------------------------------------------------
+# Load environment variables (.env → GROQ_API_KEY)
+# ----------------------------------------------------
+load_dotenv()
+
+
+# ----------------------------------------------------
+# TOOL FUNCTION (MUST be a plain function)
+# LangChain tools CANNOT wrap class methods
+# ----------------------------------------------------
+def resolve_coordinates_fn(
     latitude: float = None,
     longitude: float = None,
     location: str = None
 ) -> dict:
-    """Resolve coordinates from lat/lon or a location name."""
+    """
+    Resolve geographic coordinates from:
+    - explicit latitude & longitude OR
+    - a human-readable location name
+    """
     if latitude is not None and longitude is not None:
         return {"latitude": latitude, "longitude": longitude}
+
     if location is not None:
         lat, lon = geocode_location(location)
         return {"latitude": lat, "longitude": lon}
+
     raise ValueError("Missing location information")
 
 
-resolve_coordinates = StructuredTool.from_function(
-    func=_resolve_coordinates,
+# ----------------------------------------------------
+# Convert the function into a LangChain StructuredTool
+# ----------------------------------------------------
+resolve_coordinates_tool = StructuredTool.from_function(
+    func=resolve_coordinates_fn,
     name="resolve_coordinates",
     description="Resolve geographic coordinates from lat/lon or a location name"
 )
 
 
-load_dotenv()
-
-
+# ----------------------------------------------------
+# GeoAgent (Singleton)
+# ----------------------------------------------------
 class GeoAgent:
+    """
+    Agent responsible for:
+    1. Resolving coordinates
+    2. Classifying user intent
+    3. Searching volleyball facilities if required
+    """
+
     _instance = None
 
     def __new__(cls):
@@ -43,16 +67,24 @@ class GeoAgent:
         return cls._instance
 
     def _init(self):
-        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        self.model = "groq/compound"
+        """
+        Initialize the Groq LLM via LangChain
+        """
+        self.llm = ChatGroq(
+            groq_api_key=os.getenv("GROQ_API_KEY"),
+             model_name="llama-3.1-8b-instant",
+            temperature=0
+        )
 
+    def run(self, query: GeoQuery):
+        """
+        Main execution flow for the agent
+        """
 
-
-    def run(self, query: GeoQuery) -> str:
-        # -----------------------------
-        # 1. Resolve coordinates (LangChain tool)
-        # -----------------------------
-        coords = resolve_coordinates.invoke({
+        # --------------------------------------------
+        # 1. Resolve coordinates using the tool
+        # --------------------------------------------
+        coords = resolve_coordinates_tool.invoke({
             "latitude": query.latitude,
             "longitude": query.longitude,
             "location": query.location
@@ -61,34 +93,35 @@ class GeoAgent:
         lat = coords["latitude"]
         lon = coords["longitude"]
 
-
-        decision = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        "Classify the intent of this query.\n"
-                        "Return ONLY one word: search_volleyball or other.\n\n"
-                        f"Query: {query.text_query}"
-                    )
-                }
-            ],
-            temperature=0
+        # --------------------------------------------
+        # 2. Classify intent using the LLM
+        # --------------------------------------------
+        response = self.llm.invoke(
+            "You are a classifier.\n"
+            "You MUST answer with EXACTLY ONE WORD.\n"
+            "Valid answers:\n"
+            "- search_volleyball\n"
+            "- other\n\n"
+            "Do NOT explain.\n"
+            "Do NOT add punctuation.\n"
+            "Do NOT add extra text.\n\n"
+            f"Query: {query.text_query}"
         )
 
-        intent = decision.choices[0].message.content.strip().lower()
 
-        
+        intent = response.content.strip().lower()
+
+        # --------------------------------------------
+        # 3. Conditional business logic
+        # --------------------------------------------
         if intent == "search_volleyball":
-            facilities = search_volleyball_facilities(
+            return search_volleyball_facilities(
                 latitude=lat,
                 longitude=lon,
                 radius_km=query.radius_km
             )
-            return facilities
 
-        # -----------------------------
-        # 4. No search required
-        # -----------------------------
-        return decision.choices[0].message.content
+        # --------------------------------------------
+        # 4. Fallback response
+        # --------------------------------------------
+        return response.content

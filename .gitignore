@@ -12,6 +12,10 @@ lerna-debug.log*
 
 report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
+# OpenStreetMap cache
+cache/
+
+
 # Runtime data
 
 pids
